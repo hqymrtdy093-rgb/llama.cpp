@@ -32,13 +32,16 @@ jobs:
           cache-dependency-path: examples/llama.android/**/*.gradle*
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          # The legacy "tools" SDK package is no longer served by Google.
+          # Install only platform-tools here; other packages are installed below.
+          packages: 'platform-tools'
 
       - name: Install Android SDK, NDK and CMake
         run: |
           yes | sdkmanager --licenses >/dev/null
           sdkmanager \
-            "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "cmake;3.31.6" \
