@@ -10,7 +10,8 @@ android {
     defaultConfig {
         applicationId = "com.example.llama.aichat"
 
-        minSdk = 33
+        // Android 11 is API 30. Keep the app installable on the user's Galaxy A50.
+        minSdk = 30
         targetSdk = 36
 
         versionCode = 1
