@@ -10,13 +10,16 @@ android {
     ndkVersion = "29.0.13113456"
 
     defaultConfig {
-        minSdk = 33
+        // Must match the app minSdk for Android 11 compatibility.
+        minSdk = 30
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
 
+        // The initial APK targets the user's Galaxy A50 (ARM64). Additional
+        // ABIs can be added later for broader device support.
         ndk {
-             abiFilters += listOf("arm64-v8a", "x86_64")
+             abiFilters += listOf("arm64-v8a")
         }
         externalNativeBuild {
             cmake {
