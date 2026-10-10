@@ -206,16 +206,24 @@ class MainActivity : AppCompatActivity() {
 
         val name = queryDisplayName(uri) ?: metadata.filename() + FILE_EXTENSION_GGUF
         val persisted = getPreferences(MODE_PRIVATE)
-        try {
-            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        } catch (e: Exception) {
-            Log.w(TAG, "Provider did not grant persistable URI access; copy fallback remains available.", e)
+        var hasPersistedReadGrant = contentResolver.persistedUriPermissions.any {
+            it.uri == uri && it.isReadPermission
+        }
+        if (!hasPersistedReadGrant) {
+            try {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                hasPersistedReadGrant = contentResolver.persistedUriPermissions.any {
+                    it.uri == uri && it.isReadPermission
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Provider did not grant persistable URI access; using a private copy to support restart.", e)
+            }
         }
 
         var descriptor: ParcelFileDescriptor? = null
         try {
-            descriptor = contentResolver.openFileDescriptor(uri, "r")
-            if (descriptor != null && descriptor.statSize > 0L) {
+            if (hasPersistedReadGrant) descriptor = contentResolver.openFileDescriptor(uri, "r")
+            if (hasPersistedReadGrant && descriptor != null && descriptor.statSize > 0L) {
                 val directPath = "/proc/self/fd/${descriptor.fd}"
                 try {
                     prepareEngineForModelLoad()
