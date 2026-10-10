@@ -1020,6 +1020,12 @@ class MainActivity : AppCompatActivity() {
         private const val KEY_MODEL_URIS = "model_uris"
         private const val KEY_URI_LABEL_PREFIX = "model_uri_label:"
         private const val KEY_URI_SIZE_PREFIX = "model_uri_size:"
+        private const val KEY_LAST_CHAT = "last_chat_id"
+
+        // Keep the native prompt within a conservative part of the model context.
+        private const val MAX_RESTORED_MESSAGES = 12
+        private const val MAX_RESTORED_CHARS = 900
+        private const val PERSIST_PARTIAL_EVERY_TOKENS = 8
 
         private const val BENCH_PROMPT_PROCESSING_TOKENS = 512
         private const val BENCH_TOKEN_GENERATION_TOKENS = 128
