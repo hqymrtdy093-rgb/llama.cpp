@@ -21,7 +21,11 @@ data class ChatMessageRecord(
     val content: String,
     val createdAt: Long,
     val position: Long
-) {
+)
+
+data class ImportedMessage(val role: String, val content: String)
+
+{
     val isUser: Boolean get() = role == ROLE_USER
 
     companion object {
@@ -71,15 +75,13 @@ class ChatDatabase(context: Context) :
         val cursor = if (normalized.isEmpty()) {
             db.query("chats", null, null, null, null, null, "updated_at DESC, created_at DESC")
         } else {
-            db.query(
-                "chats",
-                null,
-                "title LIKE ?",
-                arrayOf("%${normalized.replace("%", "\\%").replace("_", "\\_")}%"),
-                null,
-                null,
-                "updated_at DESC, created_at DESC",
-                null
+            val pattern = "%$normalized%"
+            db.rawQuery(
+                "SELECT c.id, c.title, c.created_at, c.updated_at FROM chats c " +
+                    "WHERE c.title LIKE ? OR EXISTS (" +
+                    "SELECT 1 FROM messages m WHERE m.chat_id = c.id AND m.content LIKE ?) " +
+                    "ORDER BY c.updated_at DESC, c.created_at DESC",
+                arrayOf(pattern, pattern)
             )
         }
         return cursor.use { c -> buildList(c) { getChatRecord(c) } }
@@ -216,6 +218,51 @@ class ChatDatabase(context: Context) :
         }
     }
 
+    /**
+     * Import one chat as a new independent conversation. IDs are regenerated to
+     * avoid collisions with chats already on the device. Chat and messages commit
+     * atomically so an interrupted restore cannot leave a half-imported chat.
+     */
+    @Synchronized
+    fun importChat(title: String, importedMessages: List<ImportedMessage>): ChatRecord {
+        require(importedMessages.size <= MAX_IMPORTED_MESSAGES) { "Too many messages in one chat." }
+        importedMessages.forEach { message ->
+            require(message.role == ChatMessageRecord.ROLE_USER ||
+                message.role == ChatMessageRecord.ROLE_ASSISTANT ||
+                message.role == ChatMessageRecord.ROLE_SYSTEM) { "Invalid message role in backup." }
+        }
+
+        val now = System.currentTimeMillis()
+        val safeTitle = title.trim().ifBlank { "Imported chat" }.take(80)
+        val chat = ChatRecord(UUID.randomUUID().toString(), safeTitle, now, now)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val chatValues = ContentValues().apply {
+                put("id", chat.id)
+                put("title", chat.title)
+                put("created_at", chat.createdAt)
+                put("updated_at", chat.updatedAt)
+            }
+            db.insertOrThrow("chats", null, chatValues)
+            importedMessages.forEachIndexed { index, message ->
+                val values = ContentValues().apply {
+                    put("id", UUID.randomUUID().toString())
+                    put("chat_id", chat.id)
+                    put("role", message.role)
+                    put("content", message.content)
+                    put("created_at", now + index)
+                    put("position", index.toLong())
+                }
+                db.insertOrThrow("messages", null, values)
+            }
+            db.setTransactionSuccessful()
+            return chat
+        } finally {
+            db.endTransaction()
+        }
+    }
+
     private fun touchChat(chatId: String) {
         val values = ContentValues().apply { put("updated_at", System.currentTimeMillis()) }
         writableDatabase.update("chats", values, "id = ?", arrayOf(chatId))
@@ -246,5 +293,6 @@ class ChatDatabase(context: Context) :
     companion object {
         private const val DATABASE_NAME = "localmind_chats.db"
         private const val DATABASE_VERSION = 1
+        private const val MAX_IMPORTED_MESSAGES = 10_000
     }
 }
