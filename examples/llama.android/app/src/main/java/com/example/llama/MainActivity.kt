@@ -1,12 +1,22 @@
 package com.example.llama
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
 import android.util.Log
+import android.view.ViewGroup
+import android.widget.ArrayAdapter
+import android.widget.Button
 import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.addCallback
@@ -17,12 +27,16 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.arm.aichat.AiChat
+import com.arm.aichat.ConversationTurn
 import com.arm.aichat.InferenceEngine
 import com.arm.aichat.gguf.GgufMetadata
 import com.arm.aichat.gguf.GgufMetadataReader
 import com.google.android.material.floatingactionbutton.FloatingActionButton
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
@@ -40,6 +54,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var messagesRv: RecyclerView
     private lateinit var userInputEt: EditText
     private lateinit var userActionFab: FloatingActionButton
+    private lateinit var chatsButton: Button
+    private lateinit var chatDatabase: ChatDatabase
+    private var currentChatId: String = ""
 
     // Arm AI Chat inference engine
     private lateinit var engine: InferenceEngine
@@ -50,7 +67,7 @@ class MainActivity : AppCompatActivity() {
     private var isModelReady = false
     private val messages = mutableListOf<Message>()
     private val lastAssistantMsg = StringBuilder()
-    private val messageAdapter = MessageAdapter(messages)
+    private val messageAdapter = MessageAdapter(messages) { message -> showMessageActions(message) }
 
     private data class LoadedModel(
         val displayName: String,
@@ -73,6 +90,12 @@ class MainActivity : AppCompatActivity() {
         messagesRv.adapter = messageAdapter
         userInputEt = findViewById(R.id.user_input)
         userActionFab = findViewById(R.id.fab)
+        chatsButton = findViewById(R.id.chats_button)
+        chatDatabase = ChatDatabase(applicationContext)
+        initializeChatState()
+
+        chatsButton.setOnClickListener { showChatsDialog() }
+        findViewById<Button>(R.id.new_chat_button).setOnClickListener { createAndSwitchChat() }
 
         // Initialize engine, then restore the last selected model if it still exists.
         userActionFab.isEnabled = false
@@ -114,6 +137,9 @@ class MainActivity : AppCompatActivity() {
                         null
                     }
                 }
+                if (restoredDescription != null) {
+                    restoreCurrentConversationHistoryToEngine(currentChatId)
+                }
                 withContext(Dispatchers.Main) {
                     if (restoredDescription != null) {
                         isModelReady = true
@@ -126,7 +152,6 @@ class MainActivity : AppCompatActivity() {
                     }
                     userActionFab.isEnabled = true
                 }
-                withContext(Dispatchers.Main) { userActionFab.isEnabled = true }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to initialize engine or restore model", e)
                 withContext(Dispatchers.Main) {
@@ -171,6 +196,7 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val loaded = loadModelFromUri(uri)
+                restoreCurrentConversationHistoryToEngine(currentChatId)
                 withContext(Dispatchers.Main) {
                     isModelReady = true
                     ggufTv.text = "Ready: ${loaded.displayName}\nSize: ${formatBytes(loaded.sizeBytes)}\n${loaded.storageDescription}\n\n${loaded.details}"
@@ -435,6 +461,7 @@ class MainActivity : AppCompatActivity() {
                 prepareEngineForModelLoad()
                 isModelReady = false
                 loadModel(modelFile.name, modelFile)
+                restoreCurrentConversationHistoryToEngine(currentChatId)
                 withContext(Dispatchers.Main) {
                     isModelReady = true
                     ggufTv.text = "Ready: ${modelFile.name}\nSize: ${formatBytes(modelFile.length())}\nStored in app-private model storage."
