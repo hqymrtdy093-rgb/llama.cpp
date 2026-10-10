@@ -82,7 +82,9 @@ class MainActivity : AppCompatActivity() {
                 engineInitialized = true
                 val engineState = withTimeout(120_000L) {
                     engine.state.first {
-                        it is InferenceEngine.State.Initialized || it is InferenceEngine.State.Error
+                        it is InferenceEngine.State.Initialized ||
+                        it is InferenceEngine.State.ModelReady ||
+                        it is InferenceEngine.State.Error
                     }
                 }
                 if (engineState is InferenceEngine.State.Error) throw engineState.exception
@@ -91,13 +93,21 @@ class MainActivity : AppCompatActivity() {
                 val lastUri = prefs.getString(KEY_LAST_MODEL_URI, null)
                 val lastModel = prefs.getString(KEY_LAST_MODEL, null)
                 val restoredDescription = if (!lastUri.isNullOrBlank()) {
-                    loadModelFromUri(Uri.parse(lastUri)).let {
-                        "Ready: ${it.displayName}\nSize: ${formatBytes(it.sizeBytes)}\n${it.storageDescription}\n\n${it.details}"
+                    if (engineState is InferenceEngine.State.ModelReady) {
+                        val label = prefs.getString(KEY_LAST_MODEL_LABEL, queryDisplayName(Uri.parse(lastUri)) ?: "Selected GGUF")
+                        val size = prefs.getLong(KEY_LAST_MODEL_SIZE, 0L)
+                        "Ready: ${label}\nSize: ${formatBytes(size)}\nReused the model already loaded in memory."
+                    } else {
+                        loadModelFromUri(Uri.parse(lastUri)).let {
+                            "Ready: ${it.displayName}\nSize: ${formatBytes(it.sizeBytes)}\n${it.storageDescription}\n\n${it.details}"
+                        }
                     }
                 } else {
                     val modelFile = lastModel?.let { File(ensureModelsDirectory(), it) }
                     if (modelFile != null && modelFile.isFile && modelFile.length() > 0L) {
-                        loadModel(modelFile.name, modelFile)
+                        if (engineState !is InferenceEngine.State.ModelReady) {
+                            loadModel(modelFile.name, modelFile)
+                        }
                         "Ready: ${modelFile.name}\nSize: ${formatBytes(modelFile.length())}\nStored in app-private model storage."
                     } else {
                         prefs.edit().remove(KEY_LAST_MODEL).apply()
