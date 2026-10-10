@@ -13,7 +13,8 @@ data class Message(
 )
 
 class MessageAdapter(
-    private val messages: List<Message>
+    private val messages: List<Message>,
+    private val onMessageLongClick: (Message) -> Unit = {}
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
     companion object {
@@ -41,6 +42,10 @@ class MessageAdapter(
         if (holder is UserMessageViewHolder || holder is AssistantMessageViewHolder) {
             val textView = holder.itemView.findViewById<TextView>(R.id.msg_content)
             textView.text = message.content
+            holder.itemView.setOnLongClickListener {
+                onMessageLongClick(message)
+                true
+            }
         }
     }
 
