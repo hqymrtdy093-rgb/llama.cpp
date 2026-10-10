@@ -94,7 +94,7 @@ class MainActivity : AppCompatActivity() {
                 val lastModel = prefs.getString(KEY_LAST_MODEL, null)
                 val restoredDescription = if (!lastUri.isNullOrBlank()) {
                     if (engineState is InferenceEngine.State.ModelReady) {
-                        val label = prefs.getString(KEY_LAST_MODEL_LABEL, queryDisplayName(Uri.parse(lastUri)) ?: "Selected GGUF")
+                        val label = prefs.getString(KEY_LAST_MODEL_LABEL, null) ?: "Selected GGUF"
                         val size = prefs.getLong(KEY_LAST_MODEL_SIZE, 0L)
                         "Ready: ${label}\nSize: ${formatBytes(size)}\nReused the model already loaded in memory."
                     } else {
@@ -369,8 +369,7 @@ class MainActivity : AppCompatActivity() {
         val uris = prefs.getStringSet(KEY_MODEL_URIS, emptySet()).orEmpty()
             .sortedBy { prefs.getString(KEY_URI_LABEL_PREFIX + it, it.substringAfterLast('/')) }
         val privateBytes = files.fold(0L) { total, file -> total + file.length() }
-        val uriBytes = uris.fold(0L) { total, uri -> total + prefs.getLong(KEY_URI_SIZE_PREFIX + uri, 0L) }
-        val entries = arrayOf("Import GGUF model…", "Delete a model…") +
+        val entries = arrayOf("View storage usage…", "Import GGUF model…", "Delete a model…") +
             files.map { "${it.name}  •  ${formatBytes(it.length())}\nApp-private copy" } +
             uris.map { uri ->
                 val label = prefs.getString(KEY_URI_LABEL_PREFIX + uri, uri.substringAfterLast('/')) ?: uri
@@ -379,20 +378,49 @@ class MainActivity : AppCompatActivity() {
             }.toTypedArray()
 
         androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("LocalMind models\n${files.size + uris.size} models • ${formatBytes(privateBytes + uriBytes)}")
+            .setTitle("LocalMind models\n${files.size + uris.size} models • ${formatBytes(privateBytes)} in app storage")
             .setItems(entries) { _, index ->
                 when {
-                    index == 0 -> getContent.launch(arrayOf("*/*"))
-                    index == 1 -> showDeleteModelDialog(files, uris)
-                    index < 2 + files.size -> loadExistingModel(files[index - 2])
+                    index == 0 -> showStorageUsage(files, uris)
+                    index == 1 -> getContent.launch(arrayOf("*/*"))
+                    index == 2 -> showDeleteModelDialog(files, uris)
+                    index < 3 + files.size -> loadExistingModel(files[index - 3])
                     else -> {
-                        val uriIndex = index - 2 - files.size
+                        val uriIndex = index - 3 - files.size
                         if (uriIndex in uris.indices) handleSelectedModel(Uri.parse(uris[uriIndex]))
                     }
                 }
             }
             .setNegativeButton("Close", null)
             .show()
+    }
+
+    private fun showStorageUsage(files: List<File>, uris: List<String>) {
+        val prefs = getPreferences(MODE_PRIVATE)
+        val modelCopyBytes = files.fold(0L) { total, file -> total + file.length() }
+        val linkedOriginalBytes = uris.fold(0L) { total, uri ->
+            total + prefs.getLong(KEY_URI_SIZE_PREFIX + uri, 0L)
+        }
+        val cacheBytes = directorySize(cacheDir)
+        val totalAppDataBytes = directorySize(File(applicationInfo.dataDir))
+        val otherDataBytes = (totalAppDataBytes - modelCopyBytes - cacheBytes).coerceAtLeast(0L)
+        val details = "Model copies in app storage: ${formatBytes(modelCopyBytes)}\n" +
+            "Other app data (estimated): ${formatBytes(otherDataBytes)}\n" +
+            "Cache: ${formatBytes(cacheBytes)}\n" +
+            "Total app data (estimated): ${formatBytes(totalAppDataBytes)}\n\n" +
+            "Linked original GGUF files: ${formatBytes(linkedOriginalBytes)}\n" +
+            "Original files remain in their existing folders and are not counted as LocalMind storage."
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Storage usage")
+            .setMessage(details)
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    private fun directorySize(entry: File): Long {
+        if (!entry.exists()) return 0L
+        if (entry.isFile) return entry.length()
+        return entry.listFiles()?.fold(0L) { total, child -> total + directorySize(child) } ?: 0L
     }
 
     private fun loadExistingModel(modelFile: File) {
@@ -444,7 +472,9 @@ class MainActivity : AppCompatActivity() {
                 val deletingPrivateFile = index < files.size
                 val file = if (deletingPrivateFile) files[index] else null
                 val uriText = if (deletingPrivateFile) null else uris[index - files.size]
-                val label = file?.name ?: prefs.getString(KEY_URI_LABEL_PREFIX + uriText, uriText) ?: "model"
+                val label = file?.name ?: uriText?.let { uri ->
+                    prefs.getString(KEY_URI_LABEL_PREFIX + uri, uri)
+                } ?: "model"
                 androidx.appcompat.app.AlertDialog.Builder(this)
                     .setTitle("Remove model?")
                     .setMessage(if (file != null) {
@@ -469,7 +499,7 @@ class MainActivity : AppCompatActivity() {
                             val deleted = if (currentFile != null) {
                                 currentFile.delete()
                             } else {
-                                val uri = Uri.parse(currentUri)
+                                val uri = Uri.parse(requireNotNull(currentUri))
                                 forgetUriModel(uri)
                                 try {
                                     contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
