@@ -619,7 +619,7 @@ class MainActivity : AppCompatActivity() {
         }
         val search = EditText(this).apply {
             hint = "Search chat titles"
-            singleLine = true
+            setSingleLine(true)
             inputType = InputType.TYPE_CLASS_TEXT
         }
         val listView = ListView(this)
@@ -840,7 +840,7 @@ class MainActivity : AppCompatActivity() {
             setText(chat.title)
             setSelection(text.length)
             hint = "Chat title"
-            singleLine = true
+            setSingleLine(true)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
         }
         androidx.appcompat.app.AlertDialog.Builder(this)
