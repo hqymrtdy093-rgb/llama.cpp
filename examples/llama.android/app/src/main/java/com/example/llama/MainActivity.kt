@@ -567,39 +567,398 @@ class MainActivity : AppCompatActivity() {
     /**
      * Validate and send the user message into [InferenceEngine]
      */
-    private fun handleUserInput() {
-        userInputEt.text.toString().also { userMsg ->
-            if (userMsg.isEmpty()) {
-                Toast.makeText(this, "Input message is empty!", Toast.LENGTH_SHORT).show()
-            } else {
-                userInputEt.text = null
+    private fun initializeChatState() {
+        val chats = chatDatabase.listChats().ifEmpty { listOf(chatDatabase.createChat()) }
+        val prefs = getPreferences(MODE_PRIVATE)
+        val savedId = prefs.getString(KEY_LAST_CHAT, null)
+        currentChatId = savedId?.takeIf { chatDatabase.getChat(it) != null } ?: chats.first().id
+        prefs.edit().putString(KEY_LAST_CHAT, currentChatId).apply()
+        reloadMessagesFromDatabase(currentChatId)
+        updateChatButtonTitle()
+    }
+
+    private fun reloadMessagesFromDatabase(chatId: String) {
+        messages.clear()
+        messages.addAll(chatDatabase.getMessages(chatId).map { record ->
+            Message(record.id, record.content, record.role == ChatMessageRecord.ROLE_USER)
+        })
+        messageAdapter.notifyDataSetChanged()
+        if (messages.isNotEmpty()) messagesRv.scrollToPosition(0)
+    }
+
+    private fun updateChatButtonTitle() {
+        if (!::chatsButton.isInitialized || !::chatDatabase.isInitialized) return
+        val title = chatDatabase.getChat(currentChatId)?.title ?: "New chat"
+        chatsButton.text = "Chats: ${title.take(22)}"
+    }
+
+    private fun createAndSwitchChat() {
+        val chat = chatDatabase.createChat()
+        switchToChat(chat.id)
+    }
+
+    private fun showChatsDialog() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+        }
+        val search = EditText(this).apply {
+            hint = "Search chat titles"
+            singleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
+        val listView = ListView(this)
+        container.addView(search, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        container.addView(listView, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(260)
+        ))
+
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val newButton = Button(this).apply { text = "New" }
+        val renameButton = Button(this).apply { text = "Rename" }
+        val deleteButton = Button(this).apply { text = "Delete" }
+        actions.addView(newButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        actions.addView(renameButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        actions.addView(deleteButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        container.addView(actions)
+
+        val displayed = mutableListOf<ChatRecord>()
+        val adapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, mutableListOf())
+        listView.adapter = adapter
+
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Chats and history")
+            .setView(container)
+            .setNegativeButton("Close", null)
+            .create()
+
+        fun refresh(query: String) {
+            displayed.clear()
+            displayed.addAll(chatDatabase.listChats(query))
+            adapter.clear()
+            adapter.addAll(displayed.map { chat ->
+                val selected = if (chat.id == currentChatId) "  •  Current" else ""
+                "${chat.title}${selected}\n${chatDatabase.getMessages(chat.id).size} messages"
+            })
+            adapter.notifyDataSetChanged()
+        }
+
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(text: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(text: CharSequence?, start: Int, before: Int, count: Int) {
+                refresh(text?.toString().orEmpty())
+            }
+            override fun afterTextChanged(text: Editable?) = Unit
+        })
+        listView.setOnItemClickListener { _, _, index, _ ->
+            displayed.getOrNull(index)?.let { chat ->
+                dialog.dismiss()
+                switchToChat(chat.id)
+            }
+        }
+        newButton.setOnClickListener {
+            dialog.dismiss()
+            createAndSwitchChat()
+        }
+        renameButton.setOnClickListener {
+            dialog.dismiss()
+            showRenameChatDialog(currentChatId)
+        }
+        deleteButton.setOnClickListener {
+            dialog.dismiss()
+            showDeleteChatDialog(currentChatId)
+        }
+        refresh("")
+        dialog.show()
+    }
+
+    private fun showRenameChatDialog(chatId: String) {
+        val chat = chatDatabase.getChat(chatId) ?: return
+        val nameInput = EditText(this).apply {
+            setText(chat.title)
+            setSelection(text.length)
+            hint = "Chat title"
+            singleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Rename chat")
+            .setView(nameInput)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Save") { _, _ ->
+                val title = nameInput.text.toString().trim()
+                if (title.isNotEmpty()) {
+                    chatDatabase.renameChat(chatId, title)
+                    updateChatButtonTitle()
+                } else {
+                    Toast.makeText(this, "Title cannot be empty.", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .show()
+    }
+
+    private fun showDeleteChatDialog(chatId: String) {
+        val chat = chatDatabase.getChat(chatId) ?: return
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Delete chat?")
+            .setMessage("Delete \"${chat.title}\" and all its saved messages? This cannot be undone.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Delete") { _, _ ->
+                lifecycleScope.launch {
+                    generationJob?.cancelAndJoin()
+                    chatDatabase.deleteChat(chatId)
+                    val remaining = chatDatabase.listChats()
+                    val next = if (remaining.isEmpty()) chatDatabase.createChat() else remaining.first()
+                    switchToChat(next.id)
+                }
+            }
+            .show()
+    }
+
+    private fun switchToChat(chatId: String) {
+        if (chatDatabase.getChat(chatId) == null) return
+        lifecycleScope.launch {
+            generationJob?.cancelAndJoin()
+            currentChatId = chatId
+            getPreferences(MODE_PRIVATE).edit().putString(KEY_LAST_CHAT, chatId).apply()
+            reloadMessagesFromDatabase(chatId)
+            updateChatButtonTitle()
+
+            if (isModelReady) {
                 userInputEt.isEnabled = false
                 userActionFab.isEnabled = false
+                try {
+                    withContext(Dispatchers.IO) {
+                        engine.restoreConversationHistory(historyForEngine(chatId))
+                    }
+                    userInputEt.isEnabled = true
+                    userActionFab.isEnabled = true
+                    userActionFab.setImageResource(R.drawable.outline_send_24)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Could not restore selected chat", e)
+                    userInputEt.isEnabled = false
+                    userActionFab.isEnabled = true
+                    Toast.makeText(this@MainActivity, "Could not restore chat context: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
 
-                // Update message states
-                messages.add(Message(UUID.randomUUID().toString(), userMsg, true))
-                lastAssistantMsg.clear()
-                messages.add(Message(UUID.randomUUID().toString(), lastAssistantMsg.toString(), false))
+    private fun historyForEngine(chatId: String): List<ConversationTurn> =
+        chatDatabase.getMessages(chatId)
+            .filterNot { it.role == ChatMessageRecord.ROLE_ASSISTANT && it.content.isBlank() }
+            .takeLast(MAX_RESTORED_MESSAGES)
+            .map { turn ->
+                ConversationTurn(turn.role, turn.content.takeLast(MAX_RESTORED_CHARS))
+            }
 
-                generationJob = lifecycleScope.launch(Dispatchers.Default) {
-                    engine.sendUserPrompt(userMsg)
-                        .onCompletion {
-                            withContext(Dispatchers.Main) {
-                                userInputEt.isEnabled = true
+    private suspend fun restoreCurrentConversationHistoryToEngine(chatId: String) {
+        engine.restoreConversationHistory(historyForEngine(chatId))
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun showMessageActions(message: Message) {
+        val options = mutableListOf("Copy")
+        if (message.isUser) options.add("Edit and resend")
+        else options.add("Regenerate answer")
+        options.add("Delete message")
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle(if (message.isUser) "User message" else "Assistant message")
+            .setItems(options.toTypedArray()) { _, which ->
+                when (options[which]) {
+                    "Copy" -> copyMessage(message)
+                    "Edit and resend" -> editAndResend(message)
+                    "Regenerate answer" -> regenerateAnswer(message)
+                    "Delete message" -> deleteMessageAndRestoreContext(message)
+                }
+            }
+            .show()
+    }
+
+    private fun copyMessage(message: Message) {
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("LocalMind message", message.content))
+        Toast.makeText(this, "Message copied.", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun editAndResend(message: Message) {
+        val record = chatDatabase.getMessages(currentChatId).firstOrNull { it.id == message.id } ?: return
+        val editor = EditText(this).apply {
+            setText(record.content)
+            setSelection(text.length)
+            minLines = 3
+            maxLines = 8
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Edit and resend")
+            .setView(editor)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Resend") { _, _ ->
+                val editedText = editor.text.toString().trim()
+                if (editedText.isNotEmpty()) {
+                    lifecycleScope.launch {
+                        generationJob?.cancelAndJoin()
+                        chatDatabase.deleteMessagesFrom(currentChatId, record.position)
+                        reloadMessagesFromDatabase(currentChatId)
+                        if (isModelReady) {
+                            withContext(Dispatchers.IO) {
+                                engine.restoreConversationHistory(historyForEngine(currentChatId))
+                            }
+                            sendMessage(editedText)
+                        } else {
+                            userInputEt.setText(editedText)
+                        }
+                    }
+                }
+            }
+            .show()
+    }
+
+    private fun regenerateAnswer(message: Message) {
+        val records = chatDatabase.getMessages(currentChatId)
+        val assistantIndex = records.indexOfFirst { it.id == message.id }
+        if (assistantIndex < 0) return
+        val userRecord = records.take(assistantIndex)
+            .lastOrNull { it.role == ChatMessageRecord.ROLE_USER }
+        if (userRecord == null) {
+            Toast.makeText(this, "No preceding user message to regenerate.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val prompt = userRecord.content
+        lifecycleScope.launch {
+            generationJob?.cancelAndJoin()
+            chatDatabase.deleteMessagesFrom(currentChatId, userRecord.position)
+            reloadMessagesFromDatabase(currentChatId)
+            if (isModelReady) {
+                withContext(Dispatchers.IO) {
+                    engine.restoreConversationHistory(historyForEngine(currentChatId))
+                }
+                sendMessage(prompt)
+            } else {
+                userInputEt.setText(prompt)
+                Toast.makeText(this@MainActivity, "Load a model before regenerating.", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun deleteMessageAndRestoreContext(message: Message) {
+        val records = chatDatabase.getMessages(currentChatId)
+        val index = records.indexOfFirst { it.id == message.id }
+        if (index < 0) return
+        val record = records[index]
+        val deleteFrom = if (record.role == ChatMessageRecord.ROLE_USER) {
+            record.position
+        } else {
+            records.take(index).lastOrNull { it.role == ChatMessageRecord.ROLE_USER }?.position ?: record.position
+        }
+        lifecycleScope.launch {
+            generationJob?.cancelAndJoin()
+            chatDatabase.deleteMessagesFrom(currentChatId, deleteFrom)
+            reloadMessagesFromDatabase(currentChatId)
+            if (isModelReady) {
+                try {
+                    withContext(Dispatchers.IO) {
+                        engine.restoreConversationHistory(historyForEngine(currentChatId))
+                    }
+                } catch (e: Exception) {
+                    Toast.makeText(this@MainActivity, "Could not update model context: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun handleUserInput() {
+        val userMessage = userInputEt.text.toString().trim()
+        if (userMessage.isEmpty()) {
+            Toast.makeText(this, "Input message is empty!", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!isModelReady) {
+            getContent.launch(arrayOf("*/*"))
+            return
+        }
+        userInputEt.text = null
+        sendMessage(userMessage)
+    }
+
+    private fun sendMessage(userMessage: String) {
+        val prompt = userMessage.trim()
+        if (prompt.isEmpty() || !isModelReady || currentChatId.isBlank()) return
+
+        val targetChatId = currentChatId
+        val userRecord = chatDatabase.insertMessage(
+            targetChatId, ChatMessageRecord.ROLE_USER, prompt
+        )
+        val assistantRecord = chatDatabase.insertMessage(
+            targetChatId, ChatMessageRecord.ROLE_ASSISTANT, ""
+        )
+        if (targetChatId == currentChatId) {
+            messages.add(Message(userRecord.id, userRecord.content, true))
+            messages.add(Message(assistantRecord.id, "", false))
+            messageAdapter.notifyDataSetChanged()
+            messagesRv.scrollToPosition(0)
+            updateChatButtonTitle()
+        }
+        userInputEt.isEnabled = false
+        userActionFab.isEnabled = false
+        lastAssistantMsg.clear()
+        lastAssistantMsg.append("")
+
+        val answer = StringBuilder()
+        generationJob = lifecycleScope.launch(Dispatchers.Default) {
+            var tokenCount = 0
+            try {
+                engine.sendUserPrompt(prompt)
+                    .onCompletion {
+                        chatDatabase.updateMessage(assistantRecord.id, answer.toString())
+                        withContext(NonCancellable + Dispatchers.Main) {
+                            if (currentChatId == targetChatId) {
+                                userInputEt.isEnabled = isModelReady
                                 userActionFab.isEnabled = true
                             }
-                        }.collect { token ->
-                            withContext(Dispatchers.Main) {
-                                val messageCount = messages.size
-                                check(messageCount > 0 && !messages[messageCount - 1].isUser)
-
-                                messages.removeAt(messageCount - 1).copy(
-                                    content = lastAssistantMsg.append(token).toString()
-                                ).let { messages.add(it) }
-
-                                messageAdapter.notifyItemChanged(messages.size - 1)
+                        }
+                    }
+                    .collect { token ->
+                        answer.append(token)
+                        tokenCount++
+                        if (tokenCount % PERSIST_PARTIAL_EVERY_TOKENS == 0) {
+                            chatDatabase.updateMessage(assistantRecord.id, answer.toString())
+                        }
+                        withContext(Dispatchers.Main) {
+                            if (currentChatId == targetChatId) {
+                                val index = messages.indexOfFirst { it.id == assistantRecord.id }
+                                if (index >= 0) {
+                                    messages[index] = messages[index].copy(content = answer.toString())
+                                    messageAdapter.notifyItemChanged(index)
+                                }
                             }
                         }
+                    }
+                chatDatabase.updateMessage(assistantRecord.id, answer.toString())
+            } catch (e: CancellationException) {
+                chatDatabase.updateMessage(assistantRecord.id, answer.toString())
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Chat generation failed", e)
+                val failureText = if (answer.isEmpty()) {
+                    "[Generation failed: ${e.message ?: e.javaClass.simpleName}]"
+                } else {
+                    answer.toString()
+                }
+                chatDatabase.updateMessage(assistantRecord.id, failureText)
+                withContext(Dispatchers.Main) {
+                    if (currentChatId == targetChatId) {
+                        val index = messages.indexOfFirst { it.id == assistantRecord.id }
+                        if (index >= 0) {
+                            messages[index] = messages[index].copy(content = failureText)
+                            messageAdapter.notifyItemChanged(index)
+                        }
+                        Toast.makeText(this@MainActivity, "Generation failed: ${e.message}", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
         }
