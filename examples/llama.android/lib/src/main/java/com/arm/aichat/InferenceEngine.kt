@@ -4,6 +4,9 @@ import com.arm.aichat.InferenceEngine.State
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
+/** A persisted turn used to rebuild the native conversation context. */
+data class ConversationTurn(val role: String, val content: String)
+
 /**
  * Interface defining the core LLM inference operations.
  */
@@ -24,6 +27,9 @@ interface InferenceEngine {
      * Sends a system prompt to the loaded model
      */
     suspend fun setSystemPrompt(systemPrompt: String)
+
+    /** Clears the native conversation state and feeds saved turns back into the model context. */
+    suspend fun restoreConversationHistory(history: List<ConversationTurn>)
 
     /**
      * Sends a user prompt to the loaded model and returns a Flow of generated tokens.
