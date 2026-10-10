@@ -61,9 +61,40 @@ class MainActivity : AppCompatActivity() {
         userInputEt = findViewById(R.id.user_input)
         userActionFab = findViewById(R.id.fab)
 
-        // Arm AI Chat initialization
+        // Initialize engine, then restore the last selected model if it still exists.
+        userActionFab.isEnabled = false
         lifecycleScope.launch(Dispatchers.Default) {
-            engine = AiChat.getInferenceEngine(applicationContext)
+            try {
+                engine = AiChat.getInferenceEngine(applicationContext)
+                val lastModel = getPreferences(MODE_PRIVATE).getString(KEY_LAST_MODEL, null)
+                val modelFile = lastModel?.let { File(ensureModelsDirectory(), it) }
+                if (modelFile != null && modelFile.isFile && modelFile.length() > 0L) {
+                    loadModel(modelFile.name, modelFile)
+                    withContext(Dispatchers.Main) {
+                        isModelReady = true
+                        ggufTv.text = "Ready: ${modelFile.name}\nSize: ${formatBytes(modelFile.length())}\nStored in app-private model storage."
+                        userInputEt.hint = "Type and send a message!"
+                        userInputEt.isEnabled = true
+                        userActionFab.setImageResource(R.drawable.outline_send_24)
+                    }
+                } else {
+                    getPreferences(MODE_PRIVATE).edit().remove(KEY_LAST_MODEL).apply()
+                    withContext(Dispatchers.Main) {
+                        ggufTv.text = "No model loaded. Tap the folder button to import a GGUF model, or Manage Models to choose an existing one."
+                    }
+                }
+                withContext(Dispatchers.Main) { userActionFab.isEnabled = true }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to initialize engine or restore model", e)
+                withContext(Dispatchers.Main) {
+                    userActionFab.isEnabled = true
+                    Toast.makeText(this@MainActivity, "Initialization failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+
+        findViewById<android.view.View>(R.id.models_button).setOnClickListener {
+            showModelManager()
         }
 
         // Upon CTA button tapped
@@ -113,8 +144,10 @@ class MainActivity : AppCompatActivity() {
                 }?.let { modelFile ->
                     loadModel(modelName, modelFile)
 
+                    getPreferences(MODE_PRIVATE).edit().putString(KEY_LAST_MODEL, modelFile.name).apply()
                     withContext(Dispatchers.Main) {
                         isModelReady = true
+                        ggufTv.text = "Ready: ${modelFile.name}\nSize: ${formatBytes(modelFile.length())}\n\n${metadata}"
                         userInputEt.hint = "Type and send a message!"
                         userInputEt.isEnabled = true
                         userActionFab.setImageResource(R.drawable.outline_send_24)
@@ -155,8 +188,114 @@ class MainActivity : AppCompatActivity() {
             withContext(Dispatchers.Main) {
                 userInputEt.hint = "Loading model..."
             }
-            engine.loadModel(modelFile.path)
+            engine.loadModel(modelFile.absolutePath)
+            getPreferences(MODE_PRIVATE).edit().putString(KEY_LAST_MODEL, modelFile.name).apply()
         }
+
+    /** Shows locally stored GGUF models and model-management actions. */
+    private fun showModelManager() {
+        val files = ensureModelsDirectory().listFiles()
+            ?.filter { it.isFile && it.extension.equals("gguf", ignoreCase = true) }
+            ?.sortedBy { it.name.lowercase(java.util.Locale.ROOT) }
+            .orEmpty()
+        val entries = arrayOf("Import GGUF model…", "Delete a stored model…") +
+            files.map { "${it.name}  •  ${formatBytes(it.length())}" }.toTypedArray()
+
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("LocalMind models")
+            .setItems(entries) { _, index ->
+                when (index) {
+                    0 -> getContent.launch(arrayOf("*/*"))
+                    1 -> showDeleteModelDialog(files)
+                    else -> {
+                        val modelIndex = index - 2
+                        if (modelIndex in files.indices) loadExistingModel(files[modelIndex])
+                    }
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun loadExistingModel(modelFile: File) {
+        if (!modelFile.isFile || modelFile.length() <= 0L) {
+            Toast.makeText(this, "Model file is missing or empty.", Toast.LENGTH_LONG).show()
+            return
+        }
+        userActionFab.isEnabled = false
+        userInputEt.isEnabled = false
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                if (isModelReady) engine.cleanUp()
+                isModelReady = false
+                loadModel(modelFile.name, modelFile)
+                withContext(Dispatchers.Main) {
+                    isModelReady = true
+                    ggufTv.text = "Ready: ${modelFile.name}\nSize: ${formatBytes(modelFile.length())}\nStored in app-private model storage."
+                    userInputEt.hint = "Type and send a message!"
+                    userInputEt.isEnabled = true
+                    userActionFab.setImageResource(R.drawable.outline_send_24)
+                    userActionFab.isEnabled = true
+                    Toast.makeText(this@MainActivity, "Model loaded.", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not load stored model", e)
+                withContext(Dispatchers.Main) {
+                    userInputEt.isEnabled = false
+                    userActionFab.isEnabled = true
+                    Toast.makeText(this@MainActivity, "Load failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun showDeleteModelDialog(files: List<File>) {
+        if (files.isEmpty()) {
+            Toast.makeText(this, "No stored models to delete.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Choose a model to delete")
+            .setItems(files.map { "${it.name}  •  ${formatBytes(it.length())}" }.toTypedArray()) { _, index ->
+                val file = files[index]
+                androidx.appcompat.app.AlertDialog.Builder(this)
+                    .setTitle("Delete model?")
+                    .setMessage("Delete ${file.name}? Only the app's stored copy will be removed; the original file will not be deleted.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Delete") { _, _ ->
+                        lifecycleScope.launch(Dispatchers.IO) {
+                            val isLastModel = getPreferences(MODE_PRIVATE).getString(KEY_LAST_MODEL, null) == file.name
+                            if (isLastModel && isModelReady) {
+                                engine.cleanUp()
+                                isModelReady = false
+                            }
+                            val deleted = file.delete()
+                            if (isLastModel) getPreferences(MODE_PRIVATE).edit().remove(KEY_LAST_MODEL).apply()
+                            withContext(Dispatchers.Main) {
+                                if (isLastModel) {
+                                    userInputEt.isEnabled = false
+                                    userActionFab.setImageResource(R.drawable.outline_folder_open_24)
+                                    userInputEt.hint = "Select a GGUF model to begin."
+                                }
+                                ggufTv.text = if (deleted) "Deleted: ${file.name}" else "Could not delete: ${file.name}"
+                                Toast.makeText(this@MainActivity, if (deleted) "Stored model deleted." else "Delete failed.", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                    .show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1024L) return "${bytes} B"
+        val kb = bytes / 1024.0
+        if (kb < 1024.0) return String.format(java.util.Locale.US, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024.0) return String.format(java.util.Locale.US, "%.1f MB", mb)
+        return String.format(java.util.Locale.US, "%.2f GB", mb / 1024.0)
+    }
 
     /**
      * Validate and send the user message into [InferenceEngine]
@@ -246,6 +385,7 @@ class MainActivity : AppCompatActivity() {
 
         private const val DIRECTORY_MODELS = "models"
         private const val FILE_EXTENSION_GGUF = ".gguf"
+        private const val KEY_LAST_MODEL = "last_model_filename"
 
         private const val BENCH_PROMPT_PROCESSING_TOKENS = 512
         private const val BENCH_TOKEN_GENERATION_TOKENS = 128
