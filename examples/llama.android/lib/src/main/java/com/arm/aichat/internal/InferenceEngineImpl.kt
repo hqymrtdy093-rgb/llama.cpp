@@ -2,6 +2,7 @@ package com.arm.aichat.internal
 
 import android.content.Context
 import android.util.Log
+import com.arm.aichat.ConversationTurn
 import com.arm.aichat.InferenceEngine
 import com.arm.aichat.UnsupportedArchitectureException
 import com.arm.aichat.internal.InferenceEngineImpl.Companion.getInstance
