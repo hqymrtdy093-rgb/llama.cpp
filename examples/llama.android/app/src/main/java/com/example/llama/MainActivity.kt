@@ -42,10 +42,13 @@ import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.UUID
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : AppCompatActivity() {
 
@@ -182,6 +185,18 @@ class MainActivity : AppCompatActivity() {
     ) { uri ->
         Log.i(TAG, "Selected file uri:\n $uri")
         uri?.let { handleSelectedModel(it) }
+    }
+
+    private val exportBackupLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) exportBackupToUri(uri)
+    }
+
+    private val importBackupLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) importBackupFromUri(uri)
     }
 
     /**
@@ -624,6 +639,13 @@ class MainActivity : AppCompatActivity() {
         actions.addView(deleteButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         container.addView(actions)
 
+        val backupActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val exportButton = Button(this).apply { text = "Export backup" }
+        val importButton = Button(this).apply { text = "Import backup" }
+        backupActions.addView(exportButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        backupActions.addView(importButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        container.addView(backupActions)
+
         val displayed = mutableListOf<ChatRecord>()
         val adapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, mutableListOf())
         listView.adapter = adapter
@@ -670,8 +692,146 @@ class MainActivity : AppCompatActivity() {
             dialog.dismiss()
             showDeleteChatDialog(currentChatId)
         }
+        exportButton.setOnClickListener {
+            dialog.dismiss()
+            exportBackupLauncher.launch("LocalMind-backup-${System.currentTimeMillis()}.json")
+        }
+        importButton.setOnClickListener {
+            dialog.dismiss()
+            importBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+        }
         refresh("")
         dialog.show()
+    }
+
+    private fun exportBackupToUri(uri: Uri) {
+        lifecycleScope.launch {
+            try {
+                val json = withContext(Dispatchers.IO) {
+                    val backupChats = JSONArray()
+                    chatDatabase.listChats().forEach { chat ->
+                        val backupMessages = JSONArray()
+                        chatDatabase.getMessages(chat.id).forEach { message ->
+                            backupMessages.put(
+                                JSONObject()
+                                    .put("role", message.role)
+                                    .put("content", message.content)
+                                    .put("createdAt", message.createdAt)
+                            )
+                        }
+                        backupChats.put(
+                            JSONObject()
+                                .put("title", chat.title)
+                                .put("createdAt", chat.createdAt)
+                                .put("updatedAt", chat.updatedAt)
+                                .put("messages", backupMessages)
+                        )
+                    }
+                    JSONObject()
+                        .put("format", BACKUP_FORMAT)
+                        .put("version", BACKUP_VERSION)
+                        .put("exportedAt", System.currentTimeMillis())
+                        .put("chats", backupChats)
+                        .toString(2)
+                }
+                withContext(Dispatchers.IO) {
+                    val output = contentResolver.openOutputStream(uri, "w")
+                        ?: throw java.io.IOException("Cannot open backup destination.")
+                    output.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+                }
+                Toast.makeText(this@MainActivity, "Chat backup exported.", Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                Log.e(TAG, "Chat backup export failed", e)
+                Toast.makeText(this@MainActivity, "Backup export failed: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun importBackupFromUri(uri: Uri) {
+        lifecycleScope.launch {
+            try {
+                val parsedChats = withContext(Dispatchers.IO) {
+                    val input = contentResolver.openInputStream(uri)
+                        ?: throw java.io.IOException("Cannot open selected backup.")
+                    val bytes = input.use { stream ->
+                        ByteArrayOutputStream().use { output ->
+                            val buffer = ByteArray(8192)
+                            var total = 0
+                            while (true) {
+                                val count = stream.read(buffer)
+                                if (count < 0) break
+                                total += count
+                                if (total > MAX_BACKUP_BYTES) {
+                                    throw java.io.IOException("Backup is too large to import.")
+                                }
+                                output.write(buffer, 0, count)
+                            }
+                            output.toByteArray()
+                        }
+                    }
+                    val root = JSONObject(String(bytes, Charsets.UTF_8))
+                    if (root.optString("format") != BACKUP_FORMAT) {
+                        throw java.io.IOException("This file is not a LocalMind chat backup.")
+                    }
+                    if (root.optInt("version", -1) != BACKUP_VERSION) {
+                        throw java.io.IOException("Unsupported LocalMind backup version.")
+                    }
+                    val chatsJson = root.optJSONArray("chats")
+                        ?: throw java.io.IOException("Backup has no chats array.")
+                    if (chatsJson.length() > MAX_BACKUP_CHATS) {
+                        throw java.io.IOException("Backup contains too many chats.")
+                    }
+
+                    val result = ArrayList<ImportedChat>(chatsJson.length())
+                    var totalMessages = 0
+                    for (chatIndex in 0 until chatsJson.length()) {
+                        val chatJson = chatsJson.optJSONObject(chatIndex)
+                            ?: throw java.io.IOException("Invalid chat entry at index ${chatIndex + 1}.")
+                        val title = chatJson.optString("title", "Imported chat").trim().take(MAX_TITLE_CHARS)
+                        val messagesJson = chatJson.optJSONArray("messages") ?: JSONArray()
+                        totalMessages += messagesJson.length()
+                        if (totalMessages > MAX_BACKUP_MESSAGES) {
+                            throw java.io.IOException("Backup contains too many messages.")
+                        }
+                        val parsedMessages = ArrayList<ImportedMessage>(messagesJson.length())
+                        for (messageIndex in 0 until messagesJson.length()) {
+                            val messageJson = messagesJson.optJSONObject(messageIndex)
+                                ?: throw java.io.IOException("Invalid message entry in chat ${chatIndex + 1}.")
+                            val role = messageJson.optString("role", "")
+                            val content = messageJson.optString("content", "")
+                            if (role != ChatMessageRecord.ROLE_USER &&
+                                role != ChatMessageRecord.ROLE_ASSISTANT &&
+                                role != ChatMessageRecord.ROLE_SYSTEM) {
+                                throw java.io.IOException("Unsupported message role in backup.")
+                            }
+                            if (content.length > MAX_BACKUP_MESSAGE_CHARS) {
+                                throw java.io.IOException("A message in the backup is too large.")
+                            }
+                            parsedMessages.add(ImportedMessage(role, content))
+                        }
+                        result.add(ImportedChat(title.ifBlank { "Imported chat" }, parsedMessages))
+                    }
+                    result
+                }
+
+                if (parsedChats.isEmpty()) {
+                    Toast.makeText(this@MainActivity, "Backup contains no chats.", Toast.LENGTH_LONG).show()
+                    return@launch
+                }
+                val createdChats = withContext(Dispatchers.IO) {
+                    chatDatabase.importChats(parsedChats)
+                }
+                switchToChat(createdChats.first().id)
+                Toast.makeText(
+                    this@MainActivity,
+                    "Imported ${createdChats.size} chats.",
+                    Toast.LENGTH_LONG
+                ).show()
+            } catch (e: Exception) {
+                Log.e(TAG, "Chat backup import failed", e)
+                Toast.makeText(this@MainActivity, "Backup import failed: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun showRenameChatDialog(chatId: String) {
@@ -1021,6 +1181,13 @@ class MainActivity : AppCompatActivity() {
         private const val KEY_URI_LABEL_PREFIX = "model_uri_label:"
         private const val KEY_URI_SIZE_PREFIX = "model_uri_size:"
         private const val KEY_LAST_CHAT = "last_chat_id"
+        private const val BACKUP_FORMAT = "localmind-chat-backup"
+        private const val BACKUP_VERSION = 1
+        private const val MAX_BACKUP_BYTES = 50 * 1024 * 1024
+        private const val MAX_BACKUP_CHATS = 500
+        private const val MAX_BACKUP_MESSAGES = 20_000
+        private const val MAX_BACKUP_MESSAGE_CHARS = 200_000
+        private const val MAX_TITLE_CHARS = 80
 
         // Keep the native prompt within a conservative part of the model context.
         private const val MAX_RESTORED_MESSAGES = 12
