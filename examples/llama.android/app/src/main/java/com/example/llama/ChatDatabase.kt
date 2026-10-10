@@ -21,11 +21,7 @@ data class ChatMessageRecord(
     val content: String,
     val createdAt: Long,
     val position: Long
-)
-
-data class ImportedMessage(val role: String, val content: String)
-
-{
+) {
     val isUser: Boolean get() = role == ROLE_USER
 
     companion object {
@@ -34,6 +30,9 @@ data class ImportedMessage(val role: String, val content: String)
         const val ROLE_SYSTEM = "system"
     }
 }
+
+data class ImportedMessage(val role: String, val content: String)
+data class ImportedChat(val title: String, val messages: List<ImportedMessage>)
 
 /**
  * Small private SQLite database for persistent LocalMind chats and turns.
