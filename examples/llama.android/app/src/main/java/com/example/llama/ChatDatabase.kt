@@ -222,41 +222,63 @@ class ChatDatabase(context: Context) :
      * avoid collisions with chats already on the device. Chat and messages commit
      * atomically so an interrupted restore cannot leave a half-imported chat.
      */
+    /**
+     * Import a complete backup in one transaction. New IDs prevent collisions with
+     * existing conversations; a malformed backup cannot leave a partial import.
+     */
     @Synchronized
-    fun importChat(title: String, importedMessages: List<ImportedMessage>): ChatRecord {
-        require(importedMessages.size <= MAX_IMPORTED_MESSAGES) { "Too many messages in one chat." }
-        importedMessages.forEach { message ->
-            require(message.role == ChatMessageRecord.ROLE_USER ||
-                message.role == ChatMessageRecord.ROLE_ASSISTANT ||
-                message.role == ChatMessageRecord.ROLE_SYSTEM) { "Invalid message role in backup." }
+    fun importChats(importedChats: List<ImportedChat>): List<ChatRecord> {
+        require(importedChats.size <= MAX_IMPORTED_CHATS) { "Too many chats in backup." }
+        val totalMessages = importedChats.sumOf { it.messages.size }
+        require(totalMessages <= MAX_IMPORTED_MESSAGES) { "Too many messages in backup." }
+        importedChats.forEach { chat ->
+            require(chat.title.length <= MAX_TITLE_CHARS) { "A chat title is too long." }
+            chat.messages.forEach { message ->
+                require(message.role == ChatMessageRecord.ROLE_USER ||
+                    message.role == ChatMessageRecord.ROLE_ASSISTANT ||
+                    message.role == ChatMessageRecord.ROLE_SYSTEM) {
+                    "Invalid message role in backup."
+                }
+                require(message.content.length <= MAX_IMPORTED_MESSAGE_CHARS) {
+                    "A message in backup is too long."
+                }
+            }
         }
 
         val now = System.currentTimeMillis()
-        val safeTitle = title.trim().ifBlank { "Imported chat" }.take(80)
-        val chat = ChatRecord(UUID.randomUUID().toString(), safeTitle, now, now)
+        val records = importedChats.mapIndexed { index, imported ->
+            ChatRecord(
+                id = UUID.randomUUID().toString(),
+                title = imported.title.trim().ifBlank { "Imported chat" }.take(MAX_TITLE_CHARS),
+                createdAt = now + index,
+                updatedAt = now + index
+            )
+        }
         val db = writableDatabase
         db.beginTransaction()
         try {
-            val chatValues = ContentValues().apply {
-                put("id", chat.id)
-                put("title", chat.title)
-                put("created_at", chat.createdAt)
-                put("updated_at", chat.updatedAt)
-            }
-            db.insertOrThrow("chats", null, chatValues)
-            importedMessages.forEachIndexed { index, message ->
-                val values = ContentValues().apply {
-                    put("id", UUID.randomUUID().toString())
-                    put("chat_id", chat.id)
-                    put("role", message.role)
-                    put("content", message.content)
-                    put("created_at", now + index)
-                    put("position", index.toLong())
+            records.forEachIndexed { chatIndex, chat ->
+                val chatValues = ContentValues().apply {
+                    put("id", chat.id)
+                    put("title", chat.title)
+                    put("created_at", chat.createdAt)
+                    put("updated_at", chat.updatedAt)
                 }
-                db.insertOrThrow("messages", null, values)
+                db.insertOrThrow("chats", null, chatValues)
+                importedChats[chatIndex].messages.forEachIndexed { index, message ->
+                    val values = ContentValues().apply {
+                        put("id", UUID.randomUUID().toString())
+                        put("chat_id", chat.id)
+                        put("role", message.role)
+                        put("content", message.content)
+                        put("created_at", now + index)
+                        put("position", index.toLong())
+                    }
+                    db.insertOrThrow("messages", null, values)
+                }
             }
             db.setTransactionSuccessful()
-            return chat
+            return records
         } finally {
             db.endTransaction()
         }
@@ -292,6 +314,9 @@ class ChatDatabase(context: Context) :
     companion object {
         private const val DATABASE_NAME = "localmind_chats.db"
         private const val DATABASE_VERSION = 1
-        private const val MAX_IMPORTED_MESSAGES = 10_000
+        private const val MAX_IMPORTED_CHATS = 500
+        private const val MAX_IMPORTED_MESSAGES = 20_000
+        private const val MAX_IMPORTED_MESSAGE_CHARS = 200_000
+        private const val MAX_TITLE_CHARS = 80
     }
 }
