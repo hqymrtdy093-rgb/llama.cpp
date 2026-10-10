@@ -401,6 +401,89 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
 
 extern "C"
 JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_processConversationHistory(
+        JNIEnv *env,
+        jobject /*unused*/,
+        jobjectArray jroles,
+        jobjectArray jcontents
+) {
+    if (jroles == nullptr || jcontents == nullptr) {
+        LOGe("%s: null history arrays", __func__);
+        return 1;
+    }
+    const jsize role_count = env->GetArrayLength(jroles);
+    const jsize content_count = env->GetArrayLength(jcontents);
+    if (role_count != content_count) {
+        LOGe("%s: history role/content count mismatch", __func__);
+        return 1;
+    }
+
+    reset_long_term_states();
+    reset_short_term_states();
+    const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
+    const int max_context_tokens = DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM;
+
+    for (jsize i = 0; i < role_count; ++i) {
+        auto role_obj = (jstring) env->GetObjectArrayElement(jroles, i);
+        auto content_obj = (jstring) env->GetObjectArrayElement(jcontents, i);
+        if (role_obj == nullptr || content_obj == nullptr) {
+            if (role_obj) env->DeleteLocalRef(role_obj);
+            if (content_obj) env->DeleteLocalRef(content_obj);
+            LOGe("%s: null message at index %d", __func__, (int) i);
+            return 1;
+        }
+
+        const char * role_chars = env->GetStringUTFChars(role_obj, nullptr);
+        const char * content_chars = env->GetStringUTFChars(content_obj, nullptr);
+        const std::string role(role_chars ? role_chars : "");
+        const std::string content(content_chars ? content_chars : "");
+        if (role_chars) env->ReleaseStringUTFChars(role_obj, role_chars);
+        if (content_chars) env->ReleaseStringUTFChars(content_obj, content_chars);
+        env->DeleteLocalRef(role_obj);
+        env->DeleteLocalRef(content_obj);
+
+        if (role != ROLE_SYSTEM && role != ROLE_USER && role != ROLE_ASSISTANT) {
+            LOGe("%s: unsupported role '%s'", __func__, role.c_str());
+            return 1;
+        }
+
+        std::string formatted;
+        if (has_chat_template) {
+            formatted = chat_add_and_format(role, content);
+        } else {
+            common_chat_msg history_msg;
+            history_msg.role = role;
+            history_msg.content = content;
+            chat_msgs.push_back(history_msg);
+            if (role == ROLE_SYSTEM) {
+                formatted = "System: " + content + "\n";
+            } else if (role == ROLE_USER) {
+                formatted = "User: " + content + "\nAssistant: ";
+            } else {
+                formatted = content + "\n";
+            }
+        }
+
+        const auto tokens = common_tokenize(g_context, formatted, has_chat_template, has_chat_template);
+        if (tokens.empty()) continue;
+        if (current_position + (llama_pos) tokens.size() >= max_context_tokens) {
+            LOGw("%s: saved history exceeded context budget at message %d; refusing unsafe partial restore",
+                 __func__, (int) i);
+            return 2;
+        }
+        if (decode_tokens_in_batches(g_context, g_batch, tokens, current_position, false) != 0) {
+            LOGe("%s: failed decoding history message %d", __func__, (int) i);
+            return 3;
+        }
+        current_position += (llama_pos) tokens.size();
+    }
+
+    LOGi("%s: restored %d saved messages into native context", __func__, (int) role_count);
+    return 0;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
         JNIEnv *env,
         jobject /*unused*/,
