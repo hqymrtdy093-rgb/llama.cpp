@@ -1,8 +1,10 @@
 package com.example.llama
 
+import android.content.Intent
 import android.net.Uri
-import android.provider.OpenableColumns
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
+import android.provider.OpenableColumns
 import android.util.Log
 import android.widget.EditText
 import android.widget.TextView
@@ -21,9 +23,11 @@ import com.arm.aichat.gguf.GgufMetadataReader
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
@@ -48,6 +52,13 @@ class MainActivity : AppCompatActivity() {
     private val lastAssistantMsg = StringBuilder()
     private val messageAdapter = MessageAdapter(messages)
 
+    private data class LoadedModel(
+        val displayName: String,
+        val sizeBytes: Long,
+        val details: String,
+        val storageDescription: String
+    )
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -69,22 +80,41 @@ class MainActivity : AppCompatActivity() {
             try {
                 engine = AiChat.getInferenceEngine(applicationContext)
                 engineInitialized = true
-                val lastModel = getPreferences(MODE_PRIVATE).getString(KEY_LAST_MODEL, null)
-                val modelFile = lastModel?.let { File(ensureModelsDirectory(), it) }
-                if (modelFile != null && modelFile.isFile && modelFile.length() > 0L) {
-                    loadModel(modelFile.name, modelFile)
-                    withContext(Dispatchers.Main) {
+                val engineState = withTimeout(120_000L) {
+                    engine.state.first {
+                        it is InferenceEngine.State.Initialized || it is InferenceEngine.State.Error
+                    }
+                }
+                if (engineState is InferenceEngine.State.Error) throw engineState.exception
+
+                val prefs = getPreferences(MODE_PRIVATE)
+                val lastUri = prefs.getString(KEY_LAST_MODEL_URI, null)
+                val lastModel = prefs.getString(KEY_LAST_MODEL, null)
+                val restoredDescription = if (!lastUri.isNullOrBlank()) {
+                    loadModelFromUri(Uri.parse(lastUri)).let {
+                        "Ready: ${it.displayName}\nSize: ${formatBytes(it.sizeBytes)}\n${it.storageDescription}\n\n${it.details}"
+                    }
+                } else {
+                    val modelFile = lastModel?.let { File(ensureModelsDirectory(), it) }
+                    if (modelFile != null && modelFile.isFile && modelFile.length() > 0L) {
+                        loadModel(modelFile.name, modelFile)
+                        "Ready: ${modelFile.name}\nSize: ${formatBytes(modelFile.length())}\nStored in app-private model storage."
+                    } else {
+                        prefs.edit().remove(KEY_LAST_MODEL).apply()
+                        null
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    if (restoredDescription != null) {
                         isModelReady = true
-                        ggufTv.text = "Ready: ${modelFile.name}\nSize: ${formatBytes(modelFile.length())}\nStored in app-private model storage."
+                        ggufTv.text = restoredDescription
                         userInputEt.hint = "Type and send a message!"
                         userInputEt.isEnabled = true
                         userActionFab.setImageResource(R.drawable.outline_send_24)
-                    }
-                } else {
-                    getPreferences(MODE_PRIVATE).edit().remove(KEY_LAST_MODEL).apply()
-                    withContext(Dispatchers.Main) {
+                    } else {
                         ggufTv.text = "No model loaded. Tap the folder button to import a GGUF model, or Manage Models to choose an existing one."
                     }
+                    userActionFab.isEnabled = true
                 }
                 withContext(Dispatchers.Main) { userActionFab.isEnabled = true }
             } catch (e: Exception) {
@@ -130,28 +160,17 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                val metadata = contentResolver.openInputStream(uri)?.use { input ->
-                    GgufMetadataReader.create().readStructuredMetadata(input)
-                } ?: throw java.io.IOException("Cannot open the selected file.")
-
-                val modelName = modelStorageName(uri, metadata)
-                val modelFile = contentResolver.openInputStream(uri)?.use { input ->
-                    ensureModelFile(modelName, input)
-                } ?: throw java.io.IOException("Cannot reopen the selected model file.")
-
-                prepareEngineForModelLoad()
-                loadModel(modelFile.name, modelFile)
-
+                val loaded = loadModelFromUri(uri)
                 withContext(Dispatchers.Main) {
                     isModelReady = true
-                    ggufTv.text = "Ready: ${modelFile.name}\nSize: ${formatBytes(modelFile.length())}\nPath: ${modelFile.absolutePath}\n\n${metadata}"
+                    ggufTv.text = "Ready: ${loaded.displayName}\nSize: ${formatBytes(loaded.sizeBytes)}\n${loaded.storageDescription}\n\n${loaded.details}"
                     userInputEt.hint = "Type and send a message!"
                     userInputEt.isEnabled = true
                     userActionFab.setImageResource(R.drawable.outline_send_24)
                     userActionFab.isEnabled = true
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to import or load selected model", e)
+                Log.e(TAG, "Failed to load selected model", e)
                 withContext(Dispatchers.Main) {
                     isModelReady = false
                     userInputEt.isEnabled = false
@@ -159,10 +178,96 @@ class MainActivity : AppCompatActivity() {
                     userActionFab.setImageResource(R.drawable.outline_folder_open_24)
                     userActionFab.isEnabled = true
                     ggufTv.text = "Could not load model.\n${e.message ?: e.javaClass.simpleName}"
-                    Toast.makeText(this@MainActivity, "Model import/load failed: ${e.message}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, "Model load failed: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }
+    }
+
+    /**
+     * Uses a persisted SAF grant and /proc/self/fd for regular files. Some document
+     * providers expose pipes or virtual files instead; those are copied into private
+     * storage as a compatibility fallback.
+     */
+    private suspend fun loadModelFromUri(uri: Uri): LoadedModel {
+        val metadata = contentResolver.openInputStream(uri)?.use { input ->
+            GgufMetadataReader.create().readStructuredMetadata(input)
+        } ?: throw java.io.IOException("Cannot open the selected file.")
+
+        val name = queryDisplayName(uri) ?: metadata.filename() + FILE_EXTENSION_GGUF
+        val persisted = getPreferences(MODE_PRIVATE)
+        try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (e: Exception) {
+            Log.w(TAG, "Provider did not grant persistable URI access; copy fallback remains available.", e)
+        }
+
+        var descriptor: ParcelFileDescriptor? = null
+        try {
+            descriptor = contentResolver.openFileDescriptor(uri, "r")
+            if (descriptor != null && descriptor.statSize > 0L) {
+                val directPath = "/proc/self/fd/${descriptor.fd}"
+                try {
+                    prepareEngineForModelLoad()
+                    withContext(Dispatchers.Main) { userInputEt.hint = "Loading original model..." }
+                    engine.loadModel(directPath)
+                    val size = descriptor.statSize
+                    rememberUriModel(uri, name, size)
+                    persisted.edit()
+                        .putString(KEY_LAST_MODEL_URI, uri.toString())
+                        .putString(KEY_LAST_MODEL_LABEL, name)
+                        .putLong(KEY_LAST_MODEL_SIZE, size)
+                        .remove(KEY_LAST_MODEL)
+                        .apply()
+                    return LoadedModel(name, size, metadata.toString(), "Using the original document through Android Storage Access Framework; no model copy created.")
+                } catch (directError: Exception) {
+                    Log.w(TAG, "Direct SAF file loading unavailable; falling back to one private copy.", directError)
+                    if (engine.state.value is InferenceEngine.State.Error) {
+                        try { engine.cleanUp() } catch (cleanupError: Exception) {
+                            Log.w(TAG, "Could not reset engine after direct-load failure.", cleanupError)
+                        }
+                    }
+                }
+            }
+        } finally {
+            try { descriptor?.close() } catch (_: Exception) {}
+        }
+
+        val modelName = modelStorageName(uri, metadata)
+        val modelFile = contentResolver.openInputStream(uri)?.use { input ->
+            ensureModelFile(modelName, input)
+        } ?: throw java.io.IOException("Cannot reopen the selected model file.")
+        prepareEngineForModelLoad()
+        loadModel(modelFile.name, modelFile)
+        forgetUriModel(uri)
+        return LoadedModel(modelFile.name, modelFile.length(), metadata.toString(), "Stored in app-private model storage (one copy required by this document provider).")
+    }
+
+    private fun queryDisplayName(uri: Uri): String? =
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }
+
+    private fun rememberUriModel(uri: Uri, name: String, size: Long) {
+        val prefs = getPreferences(MODE_PRIVATE)
+        val uris = prefs.getStringSet(KEY_MODEL_URIS, emptySet()).orEmpty().toMutableSet()
+        uris.add(uri.toString())
+        prefs.edit()
+            .putStringSet(KEY_MODEL_URIS, uris)
+            .putString(KEY_URI_LABEL_PREFIX + uri.toString(), name)
+            .putLong(KEY_URI_SIZE_PREFIX + uri.toString(), size)
+            .apply()
+    }
+
+    private fun forgetUriModel(uri: Uri) {
+        val prefs = getPreferences(MODE_PRIVATE)
+        val uris = prefs.getStringSet(KEY_MODEL_URIS, emptySet()).orEmpty().toMutableSet()
+        uris.remove(uri.toString())
+        prefs.edit()
+            .putStringSet(KEY_MODEL_URIS, uris)
+            .remove(KEY_URI_LABEL_PREFIX + uri.toString())
+            .remove(KEY_URI_SIZE_PREFIX + uri.toString())
+            .apply()
     }
 
     /** Uses the picker name plus URI identity to avoid collisions between different source files. */
@@ -236,19 +341,29 @@ class MainActivity : AppCompatActivity() {
             ?.filter { it.isFile && it.extension.equals("gguf", ignoreCase = true) }
             ?.sortedBy { it.name.lowercase(java.util.Locale.ROOT) }
             .orEmpty()
-        val totalBytes = files.fold(0L) { total, file -> total + file.length() }
-        val entries = arrayOf("Import GGUF model…", "Delete a stored model…") +
-            files.map { "${it.name}  •  ${formatBytes(it.length())}\n${it.absolutePath}" }.toTypedArray()
+        val prefs = getPreferences(MODE_PRIVATE)
+        val uris = prefs.getStringSet(KEY_MODEL_URIS, emptySet()).orEmpty()
+            .sortedBy { prefs.getString(KEY_URI_LABEL_PREFIX + it, it.substringAfterLast('/')) }
+        val privateBytes = files.fold(0L) { total, file -> total + file.length() }
+        val uriBytes = uris.fold(0L) { total, uri -> total + prefs.getLong(KEY_URI_SIZE_PREFIX + uri, 0L) }
+        val entries = arrayOf("Import GGUF model…", "Delete a model…") +
+            files.map { "${it.name}  •  ${formatBytes(it.length())}\nApp-private copy" } +
+            uris.map { uri ->
+                val label = prefs.getString(KEY_URI_LABEL_PREFIX + uri, uri.substringAfterLast('/')) ?: uri
+                val size = prefs.getLong(KEY_URI_SIZE_PREFIX + uri, 0L)
+                "${label}  •  ${formatBytes(size)}\nOriginal file (no copy)"
+            }.toTypedArray()
 
         androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("LocalMind models\n${files.size} stored • ${formatBytes(totalBytes)}")
+            .setTitle("LocalMind models\n${files.size + uris.size} models • ${formatBytes(privateBytes + uriBytes)}")
             .setItems(entries) { _, index ->
-                when (index) {
-                    0 -> getContent.launch(arrayOf("*/*"))
-                    1 -> showDeleteModelDialog(files)
+                when {
+                    index == 0 -> getContent.launch(arrayOf("*/*"))
+                    index == 1 -> showDeleteModelDialog(files, uris)
+                    index < 2 + files.size -> loadExistingModel(files[index - 2])
                     else -> {
-                        val modelIndex = index - 2
-                        if (modelIndex in files.indices) loadExistingModel(files[modelIndex])
+                        val uriIndex = index - 2 - files.size
+                        if (uriIndex in uris.indices) handleSelectedModel(Uri.parse(uris[uriIndex]))
                     }
                 }
             }
@@ -288,36 +403,68 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showDeleteModelDialog(files: List<File>) {
-        if (files.isEmpty()) {
+    private fun showDeleteModelDialog(files: List<File>, uris: List<String>) {
+        if (files.isEmpty() && uris.isEmpty()) {
             Toast.makeText(this, "No stored models to delete.", Toast.LENGTH_SHORT).show()
             return
         }
+        val prefs = getPreferences(MODE_PRIVATE)
+        val labels = files.map { "${it.name}  •  ${formatBytes(it.length())}" } + uris.map { uri ->
+            val name = prefs.getString(KEY_URI_LABEL_PREFIX + uri, uri.substringAfterLast('/')) ?: uri
+            val size = prefs.getLong(KEY_URI_SIZE_PREFIX + uri, 0L)
+            "${name}  •  ${formatBytes(size)} (original file)"
+        }
         androidx.appcompat.app.AlertDialog.Builder(this)
             .setTitle("Choose a model to delete")
-            .setItems(files.map { "${it.name}  •  ${formatBytes(it.length())}" }.toTypedArray()) { _, index ->
-                val file = files[index]
+            .setItems(labels.toTypedArray()) { _, index ->
+                val deletingPrivateFile = index < files.size
+                val file = if (deletingPrivateFile) files[index] else null
+                val uriText = if (deletingPrivateFile) null else uris[index - files.size]
+                val label = file?.name ?: prefs.getString(KEY_URI_LABEL_PREFIX + uriText, uriText) ?: "model"
                 androidx.appcompat.app.AlertDialog.Builder(this)
-                    .setTitle("Delete model?")
-                    .setMessage("Delete ${file.name}? Only the app's stored copy will be removed; the original file will not be deleted.")
+                    .setTitle("Remove model?")
+                    .setMessage(if (file != null) {
+                        "Delete ${file.name}? This removes only LocalMind's stored copy, not the original file."
+                    } else {
+                        "Remove ${label} from LocalMind? The original file will not be deleted."
+                    })
                     .setNegativeButton("Cancel", null)
                     .setPositiveButton("Delete") { _, _ ->
                         lifecycleScope.launch(Dispatchers.IO) {
-                            val isLastModel = getPreferences(MODE_PRIVATE).getString(KEY_LAST_MODEL, null) == file.name
-                            if (isLastModel && isModelReady) {
+                            val currentFile = file
+                            val currentUri = uriText
+                            val isLastModel = if (currentFile != null) {
+                                prefs.getString(KEY_LAST_MODEL, null) == currentFile.name
+                            } else {
+                                prefs.getString(KEY_LAST_MODEL_URI, null) == currentUri
+                            }
+                            if (isLastModel && engine.state.value is InferenceEngine.State.ModelReady) {
                                 engine.cleanUp()
                                 isModelReady = false
                             }
-                            val deleted = file.delete()
-                            if (isLastModel) getPreferences(MODE_PRIVATE).edit().remove(KEY_LAST_MODEL).apply()
+                            val deleted = if (currentFile != null) {
+                                currentFile.delete()
+                            } else {
+                                val uri = Uri.parse(currentUri)
+                                forgetUriModel(uri)
+                                try {
+                                    contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Unable to release persisted document permission", e)
+                                }
+                                true
+                            }
+                            if (isLastModel) {
+                                prefs.edit().remove(KEY_LAST_MODEL).remove(KEY_LAST_MODEL_URI).remove(KEY_LAST_MODEL_LABEL).remove(KEY_LAST_MODEL_SIZE).apply()
+                            }
                             withContext(Dispatchers.Main) {
                                 if (isLastModel) {
                                     userInputEt.isEnabled = false
                                     userActionFab.setImageResource(R.drawable.outline_folder_open_24)
                                     userInputEt.hint = "Select a GGUF model to begin."
                                 }
-                                ggufTv.text = if (deleted) "Deleted: ${file.name}" else "Could not delete: ${file.name}"
-                                Toast.makeText(this@MainActivity, if (deleted) "Stored model deleted." else "Delete failed.", Toast.LENGTH_SHORT).show()
+                                ggufTv.text = if (deleted) "Removed: ${label}" else "Could not delete: ${label}"
+                                Toast.makeText(this@MainActivity, if (deleted) "Model removed." else "Delete failed.", Toast.LENGTH_SHORT).show()
                             }
                         }
                     }
@@ -415,7 +562,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        if (engineInitialized) engine.destroy()
+        // InferenceEngineImpl is a process-wide singleton. destroy() cancels its
+        // coroutine scope permanently, so it must not be called when an Activity
+        // is recreated or merely leaves the foreground.
         super.onDestroy()
     }
 
@@ -425,6 +574,12 @@ class MainActivity : AppCompatActivity() {
         private const val DIRECTORY_MODELS = "models"
         private const val FILE_EXTENSION_GGUF = ".gguf"
         private const val KEY_LAST_MODEL = "last_model_filename"
+        private const val KEY_LAST_MODEL_URI = "last_model_uri"
+        private const val KEY_LAST_MODEL_LABEL = "last_model_label"
+        private const val KEY_LAST_MODEL_SIZE = "last_model_size"
+        private const val KEY_MODEL_URIS = "model_uris"
+        private const val KEY_URI_LABEL_PREFIX = "model_uri_label:"
+        private const val KEY_URI_SIZE_PREFIX = "model_uri_size:"
 
         private const val BENCH_PROMPT_PROCESSING_TOKENS = 512
         private const val BENCH_TOKEN_GENERATION_TOKENS = 128
