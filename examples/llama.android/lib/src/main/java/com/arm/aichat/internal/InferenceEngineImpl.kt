@@ -98,6 +98,9 @@ internal class InferenceEngineImpl private constructor(
     private external fun processSystemPrompt(systemPrompt: String): Int
 
     @FastNative
+    private external fun processConversationHistory(roles: Array<String>, contents: Array<String>): Int
+
+    @FastNative
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
 
     @FastNative
@@ -209,6 +212,29 @@ internal class InferenceEngineImpl private constructor(
             }
             Log.i(TAG, "System prompt processed! Awaiting user prompt...")
             _state.value = InferenceEngine.State.ModelReady
+        }
+
+    /**
+     * Rebuild native chat state from locally persisted turns when the user opens another chat.
+     */
+    override suspend fun restoreConversationHistory(history: List<ConversationTurn>) =
+        withContext(llamaDispatcher) {
+            check(_state.value is InferenceEngine.State.ModelReady) {
+                "Cannot restore history in ${_state.value.javaClass.simpleName}"
+            }
+            _readyForSystemPrompt = false
+            _state.value = InferenceEngine.State.ProcessingSystemPrompt
+            try {
+                val roles = history.map { it.role }.toTypedArray()
+                val contents = history.map { it.content }.toTypedArray()
+                val result = processConversationHistory(roles, contents)
+                if (result != 0) throw IOException("Failed to restore conversation history: $result")
+                _cancelGeneration = false
+                _state.value = InferenceEngine.State.ModelReady
+            } catch (e: Exception) {
+                _state.value = InferenceEngine.State.Error(e)
+                throw e
+            }
         }
 
     /**
