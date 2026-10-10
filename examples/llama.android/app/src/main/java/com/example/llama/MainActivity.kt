@@ -332,7 +332,13 @@ class MainActivity : AppCompatActivity() {
             Log.i(TAG, "Loading model $modelName")
             withContext(Dispatchers.Main) { userInputEt.hint = "Loading model..." }
             engine.loadModel(modelFile.absolutePath)
-            getPreferences(MODE_PRIVATE).edit().putString(KEY_LAST_MODEL, modelFile.name).apply()
+            // A private-copy model must take precedence over any stale SAF URI.
+            getPreferences(MODE_PRIVATE).edit()
+                .putString(KEY_LAST_MODEL, modelFile.name)
+                .remove(KEY_LAST_MODEL_URI)
+                .remove(KEY_LAST_MODEL_LABEL)
+                .remove(KEY_LAST_MODEL_SIZE)
+                .apply()
         }
 
     /** Shows locally stored GGUF models and model-management actions. */
