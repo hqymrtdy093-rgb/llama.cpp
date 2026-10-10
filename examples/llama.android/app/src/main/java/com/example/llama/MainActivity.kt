@@ -370,11 +370,11 @@ class MainActivity : AppCompatActivity() {
             .sortedBy { prefs.getString(KEY_URI_LABEL_PREFIX + it, it.substringAfterLast('/')) }
         val privateBytes = files.fold(0L) { total, file -> total + file.length() }
         val entries = arrayOf("View storage usage…", "Import GGUF model…", "Delete a model…") +
-            files.map { "${it.name}  •  ${formatBytes(it.length())}\nApp-private copy" } +
+            files.map { "${it.name}  •  ${formatBytes(it.length())}\n${it.absolutePath}" } +
             uris.map { uri ->
                 val label = prefs.getString(KEY_URI_LABEL_PREFIX + uri, uri.substringAfterLast('/')) ?: uri
                 val size = prefs.getLong(KEY_URI_SIZE_PREFIX + uri, 0L)
-                "${label}  •  ${formatBytes(size)}\nOriginal file (no copy)"
+                "${label}  •  ${formatBytes(size)}\nSAF URI: ${uri}"
             }.toTypedArray()
 
         androidx.appcompat.app.AlertDialog.Builder(this)
