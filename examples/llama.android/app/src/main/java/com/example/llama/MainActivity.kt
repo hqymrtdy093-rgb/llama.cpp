@@ -290,7 +290,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Uses the picker name plus URI identity to avoid collisions between different source files. */
     private fun modelStorageName(uri: Uri, metadata: GgufMetadata): String {
-        val fallbackName = metadata.filename()
+        val fallbackName = metadata.filename() ?: "model.gguf"
         val displayName = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
             ?.use { cursor ->
                 if (cursor.moveToFirst()) cursor.getString(0) else null
