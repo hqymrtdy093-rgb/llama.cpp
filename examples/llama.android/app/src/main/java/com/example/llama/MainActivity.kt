@@ -1,6 +1,7 @@
 package com.example.llama
 
 import android.net.Uri
+import android.provider.OpenableColumns
 import android.os.Bundle
 import android.util.Log
 import android.widget.EditText
@@ -38,6 +39,7 @@ class MainActivity : AppCompatActivity() {
 
     // Arm AI Chat inference engine
     private lateinit var engine: InferenceEngine
+    private var engineInitialized = false
     private var generationJob: Job? = null
 
     // Conversation states
@@ -66,6 +68,7 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.Default) {
             try {
                 engine = AiChat.getInferenceEngine(applicationContext)
+                engineInitialized = true
                 val lastModel = getPreferences(MODE_PRIVATE).getString(KEY_LAST_MODEL, null)
                 val modelFile = lastModel?.let { File(ensureModelsDirectory(), it) }
                 if (modelFile != null && modelFile.isFile && modelFile.length() > 0L) {
@@ -120,74 +123,109 @@ class MainActivity : AppCompatActivity() {
      * Handles the file Uri from [getContent] result
      */
     private fun handleSelectedModel(uri: Uri) {
-        // Update UI states
         userActionFab.isEnabled = false
-        userInputEt.hint = "Parsing GGUF..."
-        ggufTv.text = "Parsing metadata from selected file \n$uri"
+        userInputEt.isEnabled = false
+        userInputEt.hint = "Reading model..."
+        ggufTv.text = "Reading GGUF metadata...\n$uri"
 
         lifecycleScope.launch(Dispatchers.IO) {
-            // Parse GGUF metadata
-            Log.i(TAG, "Parsing GGUF metadata...")
-            contentResolver.openInputStream(uri)?.use {
-                GgufMetadataReader.create().readStructuredMetadata(it)
-            }?.let { metadata ->
-                // Update UI to show GGUF metadata to user
-                Log.i(TAG, "GGUF parsed: \n$metadata")
-                withContext(Dispatchers.Main) {
-                    ggufTv.text = metadata.toString()
-                }
+            try {
+                val metadata = contentResolver.openInputStream(uri)?.use { input ->
+                    GgufMetadataReader.create().readStructuredMetadata(input)
+                } ?: throw java.io.IOException("Cannot open the selected file.")
 
-                // Ensure the model file is available
-                val modelName = metadata.filename() + FILE_EXTENSION_GGUF
-                contentResolver.openInputStream(uri)?.use { input ->
+                val modelName = modelStorageName(uri, metadata)
+                val modelFile = contentResolver.openInputStream(uri)?.use { input ->
                     ensureModelFile(modelName, input)
-                }?.let { modelFile ->
-                    loadModel(modelName, modelFile)
+                } ?: throw java.io.IOException("Cannot reopen the selected model file.")
 
-                    getPreferences(MODE_PRIVATE).edit().putString(KEY_LAST_MODEL, modelFile.name).apply()
-                    withContext(Dispatchers.Main) {
-                        isModelReady = true
-                        ggufTv.text = "Ready: ${modelFile.name}\nSize: ${formatBytes(modelFile.length())}\n\n${metadata}"
-                        userInputEt.hint = "Type and send a message!"
-                        userInputEt.isEnabled = true
-                        userActionFab.setImageResource(R.drawable.outline_send_24)
-                        userActionFab.isEnabled = true
-                    }
+                prepareEngineForModelLoad()
+                loadModel(modelFile.name, modelFile)
+
+                withContext(Dispatchers.Main) {
+                    isModelReady = true
+                    ggufTv.text = "Ready: ${modelFile.name}\nSize: ${formatBytes(modelFile.length())}\nPath: ${modelFile.absolutePath}\n\n${metadata}"
+                    userInputEt.hint = "Type and send a message!"
+                    userInputEt.isEnabled = true
+                    userActionFab.setImageResource(R.drawable.outline_send_24)
+                    userActionFab.isEnabled = true
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to import or load selected model", e)
+                withContext(Dispatchers.Main) {
+                    isModelReady = false
+                    userInputEt.isEnabled = false
+                    userInputEt.hint = "Select a GGUF model to begin."
+                    userActionFab.setImageResource(R.drawable.outline_folder_open_24)
+                    userActionFab.isEnabled = true
+                    ggufTv.text = "Could not load model.\n${e.message ?: e.javaClass.simpleName}"
+                    Toast.makeText(this@MainActivity, "Model import/load failed: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }
     }
 
+    /** Uses the picker name plus URI identity to avoid collisions between different source files. */
+    private fun modelStorageName(uri: Uri, metadata: GgufMetadata): String {
+        val fallbackName = metadata.filename()
+        val displayName = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }
+        val chosenName = displayName ?: fallbackName
+        val baseName = chosenName.substringAfterLast('/')
+            .substringBeforeLast('.', missingDelimiterValue = chosenName)
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .trim('.', '_')
+            .take(72)
+            .ifBlank { "model" }
+        val sourceId = Integer.toHexString(uri.toString().hashCode())
+        return "$baseName-$sourceId.gguf"
+    }
     /**
      * Prepare the model file within app's private storage
      */
     private suspend fun ensureModelFile(modelName: String, input: InputStream) =
         withContext(Dispatchers.IO) {
-            File(ensureModelsDirectory(), modelName).also { file ->
-                // Copy the file into local storage if not yet done
-                if (!file.exists()) {
-                    Log.i(TAG, "Start copying file to $modelName")
-                    withContext(Dispatchers.Main) {
-                        userInputEt.hint = "Copying file..."
-                    }
-
-                    FileOutputStream(file).use { input.copyTo(it) }
-                    Log.i(TAG, "Finished copying file to $modelName")
-                } else {
-                    Log.i(TAG, "File already exists $modelName")
+            val directory = ensureModelsDirectory()
+            val file = File(directory, modelName)
+            if (file.isFile && file.length() > 0L) {
+                Log.i(TAG, "Reusing existing stored model $modelName")
+                file
+            } else {
+                if (file.exists()) file.delete()
+                val partial = File(directory, "$modelName.partial")
+                if (partial.exists()) partial.delete()
+                Log.i(TAG, "Copying selected model to app storage: $modelName")
+                withContext(Dispatchers.Main) { userInputEt.hint = "Copying model..." }
+                FileOutputStream(partial).use { output -> input.copyTo(output) }
+                if (!partial.isFile || partial.length() <= 0L) {
+                    partial.delete()
+                    throw java.io.IOException("The selected model file is empty.")
                 }
+                if (!partial.renameTo(file)) {
+                    partial.copyTo(file, overwrite = true)
+                    partial.delete()
+                }
+                Log.i(TAG, "Stored model: $modelName (${file.length()} bytes)")
+                file
             }
         }
 
     /**
      * Load the model file from the app private storage
      */
+    private fun prepareEngineForModelLoad() {
+        val state = engine.state.value
+        if (state is InferenceEngine.State.ModelReady || state is InferenceEngine.State.Error) {
+            engine.cleanUp()
+        }
+    }
+
     private suspend fun loadModel(modelName: String, modelFile: File) =
         withContext(Dispatchers.IO) {
             Log.i(TAG, "Loading model $modelName")
-            withContext(Dispatchers.Main) {
-                userInputEt.hint = "Loading model..."
-            }
+            withContext(Dispatchers.Main) { userInputEt.hint = "Loading model..." }
             engine.loadModel(modelFile.absolutePath)
             getPreferences(MODE_PRIVATE).edit().putString(KEY_LAST_MODEL, modelFile.name).apply()
         }
@@ -198,11 +236,12 @@ class MainActivity : AppCompatActivity() {
             ?.filter { it.isFile && it.extension.equals("gguf", ignoreCase = true) }
             ?.sortedBy { it.name.lowercase(java.util.Locale.ROOT) }
             .orEmpty()
+        val totalBytes = files.fold(0L) { total, file -> total + file.length() }
         val entries = arrayOf("Import GGUF model…", "Delete a stored model…") +
-            files.map { "${it.name}  •  ${formatBytes(it.length())}" }.toTypedArray()
+            files.map { "${it.name}  •  ${formatBytes(it.length())}\n${it.absolutePath}" }.toTypedArray()
 
         androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("LocalMind models")
+            .setTitle("LocalMind models\n${files.size} stored • ${formatBytes(totalBytes)}")
             .setItems(entries) { _, index ->
                 when (index) {
                     0 -> getContent.launch(arrayOf("*/*"))
@@ -226,7 +265,7 @@ class MainActivity : AppCompatActivity() {
         userInputEt.isEnabled = false
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                if (isModelReady) engine.cleanUp()
+                prepareEngineForModelLoad()
                 isModelReady = false
                 loadModel(modelFile.name, modelFile)
                 withContext(Dispatchers.Main) {
@@ -376,7 +415,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        engine.destroy()
+        if (engineInitialized) engine.destroy()
         super.onDestroy()
     }
 
