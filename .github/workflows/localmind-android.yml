@@ -1,16 +1,6 @@
 name: PocketGGUF Android APK
 
 on:
-  push:
-    branches:
-      - "localmind/**"
-    paths:
-      - "android-app/**"
-      - ".github/workflows/localmind-android.yml"
-  pull_request:
-    paths:
-      - "android-app/**"
-      - ".github/workflows/localmind-android.yml"
   workflow_dispatch:
 
 permissions:
