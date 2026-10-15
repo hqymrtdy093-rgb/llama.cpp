@@ -1,4 +1,4 @@
-package app.localmind
+package app.pocketgguf
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -59,7 +59,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = OledBlack
                 ) {
-                    LocalMindHome()
+                    PocketGgufHome()
                 }
             }
         }
@@ -68,7 +68,7 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun LocalMindHome() {
+private fun PocketGgufHome() {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -78,7 +78,7 @@ private fun LocalMindHome() {
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
             Text(
-                text = "LocalMind",
+                text = "PocketGGUF",
                 fontSize = 32.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color.White
