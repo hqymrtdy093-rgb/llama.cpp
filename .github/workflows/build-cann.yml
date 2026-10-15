@@ -107,13 +107,12 @@ jobs:
 #              chown -R '"${HOST_UID}"':'"${HOST_GID}"' /workspace/build
 #            '
 
-# The upstream CANN build matrix is intentionally disabled in this fork.
-# Keep a no-op job so GitHub Actions treats this file as a valid workflow
-# instead of reporting a red "workflow has no jobs" failure on feature pushes.
+# The upstream CANN build matrix is intentionally disabled to save runner resources.
+# Keep a successful no-op job so GitHub Actions does not report an invalid
+# workflow with no jobs on PocketGGUF development commits.
 jobs:
   cann-build-disabled:
-    name: CANN build intentionally disabled
-    if: false
+    name: CANN build intentionally disabled upstream
     runs-on: ubuntu-latest
     steps:
       - name: Explain disabled upstream build
