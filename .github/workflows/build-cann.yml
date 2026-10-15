@@ -106,3 +106,15 @@ jobs:
 #
 #              chown -R '"${HOST_UID}"':'"${HOST_GID}"' /workspace/build
 #            '
+
+# The upstream CANN build matrix is intentionally disabled in this fork.
+# Keep a no-op job so GitHub Actions treats this file as a valid workflow
+# instead of reporting a red "workflow has no jobs" failure on feature pushes.
+jobs:
+  cann-build-disabled:
+    name: CANN build intentionally disabled
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain disabled upstream build
+        run: echo "CANN CI is disabled upstream; PocketGGUF is built by localmind-android.yml."
