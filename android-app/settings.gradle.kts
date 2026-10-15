@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "LocalMind"
+rootProject.name = "PocketGGUF"
 include(":app")
