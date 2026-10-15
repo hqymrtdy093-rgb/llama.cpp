@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "app.localmind"
+    namespace = "app.pocketgguf"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "app.localmind"
+        applicationId = "app.pocketgguf"
         minSdk = 26
         targetSdk = 35
         versionCode = 1
